@@ -1435,6 +1435,8 @@ namespace MultiTerminal
                 _mcpServer.SpawnService.OnSpawnAgentRequested = OnSpawnAgentRequested;
                 _mcpServer.SpawnService.OnCloseRequested = OnSpawnedPaneCloseRequested;
                 _mcpServer.SpawnService.Jobs.Collected += OnSpawnJobCollected;
+                if (_mcpServer.ProjectOpenService != null)
+                    _mcpServer.ProjectOpenService.OnOpenRequested = OnProjectOpenRequested;
 
                 // The launch record (task 7d20e94c): one recorder per MT process, on the broker's
                 // database, which is open from here on. Panes are created after this (session restore
@@ -5292,6 +5294,55 @@ namespace MultiTerminal
                 return AlreadyOpenAnswer.Cancelled;
             BringPaneToFront(panesNow.First(d => d.DocId == stillOpen[0].DocId));
             return AlreadyOpenAnswer.Switched;
+        }
+
+        /// <summary>
+        /// <c>POST /api/projects/{id}/open</c> (MT Conductor, ClarionLive#83). On the UI thread: when a PM
+        /// pane has the project open, bring the first one to the front (the same pane the "already open"
+        /// question's Switch picks); otherwise post a launch on a Home tab, exactly as the header's Launch
+        /// Project does, and answer at once. The launch is posted rather than run inside this call because
+        /// it can show modal questions (the session choice, a profile refusal), and a REST caller must not
+        /// be held open until the Owner answers them.
+        /// </summary>
+        private async Task<ProjectOpenOutcome> OnProjectOpenRequested(string projectId)
+        {
+            ProjectOpenOutcome outcome = null;
+            await Task.Run(() =>
+            {
+                Invoke(new Action(() =>
+                {
+                    var project = _sharedProjectDatabase?.GetRichProject(projectId);
+                    if (project == null || !string.Equals(project.Id, projectId, StringComparison.Ordinal))
+                    {
+                        outcome = new ProjectOpenOutcome(ProjectOpenResult.NotFound, projectId);
+                        return;
+                    }
+
+                    var open = FindPanesWithProjectOpen(project.Id, launchingDocId: null, out var panes);
+                    if (open.Count > 0)
+                    {
+                        var target = panes.First(d => d.DocId == open[0].DocId);
+                        bool floating = target.DockState == DockState.Float;
+                        BringPaneToFront(target);
+                        _debugLogService?.Info("MainForm", $"open project '{project.Name}' over REST: focused '{open[0].Title}' ({open.Count} pane(s))");
+                        outcome = new ProjectOpenOutcome(ProjectOpenResult.Focused, project.Id, project.Name,
+                            PaneTitle: open[0].Title, Floating: floating, OtherPanes: open.Count - 1);
+                        return;
+                    }
+
+                    _debugLogService?.Info("MainForm", $"open project '{project.Name}' over REST: not open, launching on a Home tab");
+                    string id = project.Id;
+                    BeginInvoke(new Action(() =>
+                    {
+                        if (WindowState == FormWindowState.Minimized)
+                            WindowState = FormWindowState.Normal;
+                        Activate();
+                        RunOnHomeTab((sender, _) => OnStartScreenProjectLaunched(sender, new StartScreenLaunchEventArgs(id)));
+                    }));
+                    outcome = new ProjectOpenOutcome(ProjectOpenResult.Launching, project.Id, project.Name);
+                }));
+            }).ConfigureAwait(false);
+            return outcome;
         }
 
         /// <summary>The panes other than <paramref name="launchingDocId"/> that have the project open

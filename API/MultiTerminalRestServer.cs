@@ -28,6 +28,7 @@ namespace MultiTerminal.API
         private System.Threading.Timer _staleAgentTimer;
         private StaleTaskService _staleService;
         private SpawnService _spawnService;
+        private ProjectOpenService _projectOpenService;
         private TerminalStreamService _terminalStreamService;
         private CompanionProcessManager _companionProcessManager;
         // G8: MainForm's ProjectService instance, supplied so the REST DI shares the ONE instance the
@@ -51,6 +52,9 @@ namespace MultiTerminal.API
         /// The spawn service for programmatic terminal spawning.
         /// </summary>
         public SpawnService SpawnService => _spawnService;
+
+        /// <summary>Backs <c>POST /api/projects/{id}/open</c>; MainForm registers its callback.</summary>
+        public ProjectOpenService ProjectOpenService => _projectOpenService;
 
         /// <summary>
         /// The pool coordinator for multi-instance state management.
@@ -104,6 +108,7 @@ namespace MultiTerminal.API
             _broker = new MessageBroker();
             _poolCoordinator = new PoolCoordinator();
             _spawnService = new SpawnService();
+            _projectOpenService = new ProjectOpenService();
             _companionProcessManager = new CompanionProcessManager();
             // Required (G8): the REST DI must share MainForm's single ProjectService instance so
             // project-creation events reach the CodeGraphWatcher. Fail fast rather than silently
@@ -143,6 +148,7 @@ namespace MultiTerminal.API
                 builder.Services.AddSingleton(_broker);
                 builder.Services.AddSingleton(_poolCoordinator);
                 builder.Services.AddSingleton(_spawnService);
+                builder.Services.AddSingleton(_projectOpenService);
                 builder.Services.AddSingleton<TerminalStreamService>();
 
                 // Ticket 0ff1b520 items 3-4. Register the BROKER'S INSTANCE, never the type: the
