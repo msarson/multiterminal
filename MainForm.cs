@@ -5439,6 +5439,12 @@ namespace MultiTerminal
             pane.Activate();
             pane.FocusTerminal();
             _lastActiveTerminal = pane;
+
+            // Activate() raises no ActiveDocumentChanged when the pane already was the dock panel's active
+            // document (a click into another pane's terminal does not change it), so move the border here too.
+            // Contents, not Documents: a floating pane is not a document.
+            foreach (var termDoc in _dockPanel.Contents.OfType<TerminalDocument>())
+                termDoc.SetFocusBorder(termDoc == pane);
         }
 
         /// <summary>
@@ -8090,7 +8096,8 @@ namespace MultiTerminal
                 // is the window it sits in (the main window or a floating one).
                 // A pane showing its Home screen has no terminal to type into: it does not count.
                 TerminalDocument bordered = null;
-                foreach (var doc in _gridManager.GetAllTerminalDocuments())
+                // Contents, not Documents: a pane in a floating window is not a document.
+                foreach (var doc in _dockPanel.Contents.OfType<TerminalDocument>())
                 {
                     if (doc.HasFocusBorder && !doc.IsDisposed && !doc.IsStartScreenVisible && doc.TopLevelControl == window)
                     {
@@ -8099,11 +8106,16 @@ namespace MultiTerminal
                     }
                 }
 
-                var focused = FocusStateOf(window);
-                if (!ActivationFocus.ShouldRestore(mouseButtonDown, bordered != null, focused))
-                    return;
-
-                bordered.FocusTerminal();
+                var focused = FocusStateOf(window, out TerminalDocument focusedPane);
+                switch (ActivationFocus.Decide(mouseButtonDown, bordered != null, focused))
+                {
+                    case ActivationFocusTarget.FocusedPane:
+                        focusedPane?.FocusTerminal();
+                        break;
+                    case ActivationFocusTarget.BorderedPane:
+                        bordered?.FocusTerminal();
+                        break;
+                }
             }
             catch (Exception ex)
             {
@@ -8114,10 +8126,11 @@ namespace MultiTerminal
         /// <summary>
         /// Follows the ActiveControl chain to the control that really has focus in the window. Only the
         /// terminal itself counts as Terminal: a pane's agent panel, HUD or start screen is another control,
-        /// and focus there is kept.
+        /// and focus there is kept. <paramref name="focusedPane"/> is the pane whose terminal has focus.
         /// </summary>
-        private static ActivationFocusState FocusStateOf(Form window)
+        private static ActivationFocusState FocusStateOf(Form window, out TerminalDocument focusedPane)
         {
+            focusedPane = null;
             Control c = window.ActiveControl;
             while (c is ContainerControl cc && cc.ActiveControl != null)
                 c = cc.ActiveControl;
@@ -8132,9 +8145,12 @@ namespace MultiTerminal
                 if (p is TerminalDocument doc)
                 {
                     var terminal = doc.Terminal;
-                    return terminal != null && (terminal == c || terminal.Contains(c))
-                        ? ActivationFocusState.Terminal
-                        : ActivationFocusState.OtherControl;
+                    if (terminal != null && (terminal == c || terminal.Contains(c)))
+                    {
+                        focusedPane = doc;
+                        return ActivationFocusState.Terminal;
+                    }
+                    return ActivationFocusState.OtherControl;
                 }
             }
             return ActivationFocusState.OtherControl;
