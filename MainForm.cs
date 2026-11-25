@@ -54,6 +54,9 @@ namespace MultiTerminal
         private ProjectService _projectService;
         private ToolStripDropDownButton _recentFoldersDropdown;
         private TerminalDocument _lastActiveTerminal;
+
+        /// <summary>Floating windows already wired for <see cref="RestoreTerminalFocusOnActivate"/> (task 76a9d71a).</summary>
+        private readonly HashSet<Form> _activationHookedWindows = new HashSet<Form>();
         private Models.Project _currentProject;
 
         // REST API Server for inter-terminal communication
@@ -1024,6 +1027,9 @@ namespace MultiTerminal
             // Handle active document changes
             _dockPanel.ActiveDocumentChanged += OnActiveDocumentChanged;
             _dockPanel.ActiveContentChanged += OnActiveContentChanged;
+
+            // Alt+Tab back into a floating window must give its bordered pane focus too (task 76a9d71a).
+            _dockPanel.ContentAdded += OnContentAddedForActivation;
 
             // Robustly tear a terminal down when its tab is closed. ContentRemoved is
             // DockPanelSuite's authoritative "this content left the panel" signal — unlike
@@ -7998,6 +8004,142 @@ namespace MultiTerminal
                 $"'{activeDoc.TabText}' became active while you were typing in '{previous.TabText}'. Called from: {string.Join(" < ", callers)}");
         }
 
+        protected override void OnActivated(EventArgs e)
+        {
+            base.OnActivated(e);
+            OnHostWindowActivated(this);
+        }
+
+        private void OnContentAddedForActivation(object sender, DockContentEventArgs e)
+        {
+            if (e.Content is TerminalDocument doc)
+            {
+                doc.DockStateChanged -= OnTerminalDockStateChangedForActivation;
+                doc.DockStateChanged += OnTerminalDockStateChangedForActivation;
+            }
+
+            // A pane restored straight into a floating window never changes dock state, and its window
+            // may not exist yet while it is being added: look again once the layout has settled.
+            if (IsHandleCreated)
+                BeginInvoke(new Action(HookFloatWindowsForActivation));
+        }
+
+        private void OnTerminalDockStateChangedForActivation(object sender, EventArgs e) => HookFloatWindowsForActivation();
+
+        /// <summary>
+        /// Wires every floating window's Activated event once. Called when content is added, when a pane
+        /// changes dock state, and when the active pane changes (a pane dragged from one floating window into
+        /// another stays Float, so only the last of these sees its new window).
+        /// </summary>
+        private void HookFloatWindowsForActivation()
+        {
+            try
+            {
+                if (_dockPanel == null || _dockPanel.IsDisposed)
+                    return;
+                foreach (var floatWindow in _dockPanel.FloatWindows)
+                {
+                    if (floatWindow == null || floatWindow.IsDisposed || !_activationHookedWindows.Add(floatWindow))
+                        continue;
+                    floatWindow.Activated += (s, _) => OnHostWindowActivated((Form)s);
+                    floatWindow.Disposed += (s, _) => _activationHookedWindows.Remove((Form)s);
+
+                    // Activated before it was wired (Alt+Tab straight into a just-restored window): that
+                    // activation was missed, so act on it now. The usual guards still apply.
+                    if (Form.ActiveForm == floatWindow)
+                        OnHostWindowActivated(floatWindow);
+                }
+            }
+            catch (Exception ex)
+            {
+                _debugLogService?.Error("MainForm", $"HookFloatWindowsForActivation error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// A MultiTerminal window was activated. Read the mouse now, while it still says how the window was
+        /// activated, and restore after the activation has finished moving focus (task 76a9d71a).
+        /// </summary>
+        private void OnHostWindowActivated(Form window)
+        {
+            try
+            {
+                if (window.IsDisposed || !IsHandleCreated)
+                    return;
+                bool mouseButtonDown = Control.MouseButtons != System.Windows.Forms.MouseButtons.None;
+                BeginInvoke(new Action(() => RestoreTerminalFocusOnActivate(window, mouseButtonDown)));
+            }
+            catch (Exception ex)
+            {
+                _debugLogService?.Error("MainForm", $"OnHostWindowActivated error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Puts the keyboard focus back in the pane with the green border, if that pane is in
+        /// <paramref name="window"/> and focus is not in some other control there. See <see cref="ActivationFocus"/>.
+        /// </summary>
+        private void RestoreTerminalFocusOnActivate(Form window, bool mouseButtonDown)
+        {
+            try
+            {
+                if (window.IsDisposed || Form.ActiveForm != window)
+                    return;
+
+                // A DockContent is itself a Form, so FindForm() would return the pane: TopLevelControl
+                // is the window it sits in (the main window or a floating one).
+                // A pane showing its Home screen has no terminal to type into: it does not count.
+                TerminalDocument bordered = null;
+                foreach (var doc in _gridManager.GetAllTerminalDocuments())
+                {
+                    if (doc.HasFocusBorder && !doc.IsDisposed && !doc.IsStartScreenVisible && doc.TopLevelControl == window)
+                    {
+                        bordered = doc;
+                        break;
+                    }
+                }
+
+                var focused = FocusStateOf(window);
+                if (!ActivationFocus.ShouldRestore(mouseButtonDown, bordered != null, focused))
+                    return;
+
+                bordered.FocusTerminal();
+            }
+            catch (Exception ex)
+            {
+                _debugLogService?.Error("MainForm", $"RestoreTerminalFocusOnActivate error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Follows the ActiveControl chain to the control that really has focus in the window. Only the
+        /// terminal itself counts as Terminal: a pane's agent panel, HUD or start screen is another control,
+        /// and focus there is kept.
+        /// </summary>
+        private static ActivationFocusState FocusStateOf(Form window)
+        {
+            Control c = window.ActiveControl;
+            while (c is ContainerControl cc && cc.ActiveControl != null)
+                c = cc.ActiveControl;
+
+            // Nothing active, or only a container with nothing deeper (DockPanelSuite's dock panel, a pane,
+            // or a pane's own document form): not a control you were typing in.
+            if (c == null || c is DockPanel || c is DockPane || c is TerminalDocument)
+                return ActivationFocusState.Nothing;
+
+            for (Control p = c; p != null; p = p.Parent)
+            {
+                if (p is TerminalDocument doc)
+                {
+                    var terminal = doc.Terminal;
+                    return terminal != null && (terminal == c || terminal.Contains(c))
+                        ? ActivationFocusState.Terminal
+                        : ActivationFocusState.OtherControl;
+                }
+            }
+            return ActivationFocusState.OtherControl;
+        }
+
         /// <summary>
         /// The terminal the Owner is in, docked or floated (GH #74); see
         /// <see cref="GridLayoutManager.ActiveTerminalOrDocument"/>.
@@ -8036,6 +8178,7 @@ namespace MultiTerminal
             try
             {
                 LogSwitchAfterTyping(activeDoc);
+                HookFloatWindowsForActivation();
 
                 // The Attention Rail's highlight has to follow focus changed by clicking a TAB,
                 // not just focus it requested itself (task 42052f0c, pipeline run 1).
